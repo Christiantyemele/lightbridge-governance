@@ -77,10 +77,25 @@ kubectl -n <envoy-namespace> rollout status deployment core-gateway
 ### 4. Verify the fix works
 
 ```bash
-# Test against core-gateway with a bodyless request (GET)
+# 1. Bodyless request (GET) — must NOT return "processing state mismatch" 500
 curl -v https://core-gateway-internal.envoy-gateway-system.svc.cluster.local/v1/models
 
-# Should NOT return "processing state mismatch" 500
+# 2. POST with PII (email) — must return 200 with email redacted to <REDACTED>
+#    Before the fix this returned 502 because Envoy v1.32 stripped Content-Length
+#    to an empty string after body mutation, causing the upstream to RST_STREAM.
+curl -v https://core-gateway-internal.envoy-gateway-system.svc.cluster.local/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"mock","messages":[{"role":"user","content":"my email is jane@example.com"}]}'
+
+# 3. POST with credential — must return 422 (blocked)
+curl -v https://core-gateway-internal.envoy-gateway-system.svc.cluster.local/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"mock","messages":[{"role":"user","content":"token ghp_abcdefghijklmnopqrstuvwxyz0123456789"}]}'
+
+# 4. POST with streaming + PII — must return 200 with email redacted
+curl -v https://core-gateway-internal.envoy-gateway-system.svc.cluster.local/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"mock","stream":true,"messages":[{"role":"user","content":"my email is test@example.com"}]}'
 ```
 
 ## Architecture Context

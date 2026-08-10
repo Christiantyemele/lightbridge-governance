@@ -17,3 +17,5 @@ charts/*/charts/
 # dev-time-only tool -- its OUTPUT (the dashboard JSON) is committed and is
 # what the chart ships, so nothing at deploy or CI time runs Python at all.
 __pycache__/
+.kilo/
+charts/redact-gateway/k3d-values.yaml

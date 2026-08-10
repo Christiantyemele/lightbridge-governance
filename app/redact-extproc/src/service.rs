@@ -182,23 +182,36 @@ impl ResponseState {
                 String::from_utf8_lossy(&h.raw_value).into_owned()
             }
         };
-        let is_sse = hm.headers.iter().any(|h| {
-            h.key.eq_ignore_ascii_case("content-type")
-                && hdr_val(h)
-                    .to_ascii_lowercase()
-                    .starts_with("text/event-stream")
-        });
-        if is_sse {
-            self.mode = ResponseBodyMode::Sse;
-        }
+        let mut content_type: Option<String> = None;
+        let mut content_encoding: Option<String> = None;
         for h in &hm.headers {
             let val = hdr_val(h);
             if h.key.eq_ignore_ascii_case("content-type") {
-                self.content_type = Some(val);
+                content_type = Some(val);
             } else if h.key.eq_ignore_ascii_case("content-encoding") {
-                self.content_encoding = Some(val);
+                content_encoding = Some(val);
             }
         }
+
+        let is_gzip = content_encoding
+            .as_deref()
+            .is_some_and(|ce| ce.eq_ignore_ascii_case("gzip"));
+
+        // When the upstream compresses the body (gzip), the streaming chunks
+        // are binary ciphertext that cannot be parsed incrementally — we must
+        // buffer, decompress, and then scan. This applies regardless of
+        // Content-Type, because even SSE text is gzip-compressed on the wire.
+        if !is_gzip {
+            let is_sse = content_type
+                .as_deref()
+                .is_some_and(|ct| ct.to_ascii_lowercase().starts_with("text/event-stream"));
+            if is_sse {
+                self.mode = ResponseBodyMode::Sse;
+            }
+        }
+
+        self.content_type = content_type;
+        self.content_encoding = content_encoding;
     }
 }
 
@@ -592,11 +605,45 @@ fn handle_response_chunk(
     }
 }
 
+/// Decompress a gzip-compressed buffer in place. Leaves non-gzip data
+/// untouched. Returns an error if the data is not valid gzip.
+fn decompress_gzip(buf: &mut Vec<u8>) -> Result<(), String> {
+    use std::io::Read;
+
+    use flate2::read::GzDecoder;
+
+    if buf.len() < 2 || buf.first() != Some(&0x1f) || buf.get(1) != Some(&0x8b) {
+        return Ok(()); // not gzip, nothing to do
+    }
+    let mut decoder = GzDecoder::new(&buf[..]);
+    let mut decompressed = Vec::with_capacity(buf.len().saturating_mul(4));
+    decoder
+        .read_to_end(&mut decompressed)
+        .map_err(|e| format!("gzip decompression failed: {e}"))?;
+    *buf = decompressed;
+    Ok(())
+}
+
+/// Re-compress data as gzip. Returns `None` if `content_encoding` is not
+/// `"gzip"`, so the caller can pass through the original body unchanged.
+fn compress_as_gzip(data: &[u8], content_encoding: Option<&str>) -> Option<Vec<u8>> {
+    if !content_encoding.is_some_and(|ce| ce.eq_ignore_ascii_case("gzip")) {
+        return None;
+    }
+    use std::io::Write;
+
+    use flate2::{Compression, write::GzEncoder};
+
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(data).ok()?;
+    encoder.finish().ok()
+}
+
 /// Ceiling on a buffered (non-SSE) response body, mirroring
 /// `redact-gateway`'s `read_capped` cap. `SseHoldBack` bounds its own memory
 /// to the hold-back window regardless of stream length, but the buffered
 /// path accumulates the whole body before it can be scanned — the same
-/// trade `redact-gateway::read_capped`'s doc explains — so without a
+/// trade `redact-gateway::read_capped`'s doc explains — and so without a
 /// ceiling a provider that never sets `Content-Type: text/event-stream` but
 /// streams without stopping would grow this buffer until the pod is
 /// OOM-killed.
@@ -639,6 +686,27 @@ fn handle_buffered_response_chunk(
         return body_response(Direction::Response, Vec::new());
     }
 
+    // The upstream may return gzip-compressed JSON (production AI providers
+    // commonly do).  Decompress before parsing so that `serde_json` sees
+    // uncompressed text, not binary ciphertext.
+    let original_encoding = content_encoding;
+    let compressed_len = buf.len(); // track for Content-Length comparison below
+    if let Err(e) = decompress_gzip(buf) {
+        tracing::error!(
+            content_type,
+            content_encoding,
+            body_len = buf.len(),
+            error = %e,
+            "buffered response body gzip decompression failed"
+        );
+        return refuse_or_block(
+            Direction::Response,
+            engine,
+            metrics,
+            &format!("response body decompression failed: {e}"),
+        );
+    }
+
     let mut json = match serde_json::from_slice::<serde_json::Value>(buf) {
         Ok(json) => json,
         Err(e) => {
@@ -674,6 +742,11 @@ fn handle_buffered_response_chunk(
     match scan_response(engine, &mut json) {
         Ok(report) => {
             record(metrics, &report);
+            let redacted = serde_json::to_vec(&json).unwrap_or_else(|_| buf.clone());
+            // If the upstream sent gzip-compressed JSON, the decompressed
+            // buffer was replaced above.  Re-compress the redacted body so
+            // the Content-Encoding promise is kept.
+            let output = compress_as_gzip(&redacted, original_encoding).unwrap_or(redacted);
             if report.is_blocked() {
                 metrics.blocked_total.inc();
                 tracing::warn!(entities = ?report.blocked, "blocked response: prohibited content");
@@ -687,11 +760,7 @@ fn handle_buffered_response_chunk(
                     ),
                 );
             }
-            body_response_with_original_length(
-                Direction::Response,
-                serde_json::to_vec(&json).unwrap_or_else(|_| buf.clone()),
-                Some(buf.len()),
-            )
+            body_response_with_original_length(Direction::Response, output, Some(compressed_len))
         }
         Err(e) => refuse_or_block(
             Direction::Response,

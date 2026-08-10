@@ -29,6 +29,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 envoy-types = "0.7"
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 tonic = { version = "0.14", default-features = false, features = ["codegen", "transport", "router"] }
 prost = { version = "0.14", default-features = false, features = ["derive"] }
 tokio-stream = { version = "0.1", features = ["sync"] }

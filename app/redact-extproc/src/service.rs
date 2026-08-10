@@ -140,9 +140,14 @@ struct ResponseState {
     /// function's own comment on why a body snippet must never be logged
     /// (AGENTS.md: never log a request/response body) even though these two
     /// headers alone are usually enough to tell "this was compressed" from
-    /// "this genuinely isn't JSON" apart.
+    /// "this genuinely isn't JSON" apart without ever needing the content itself.
     content_type: Option<String>,
     content_encoding: Option<String>,
+    /// Accumulates gzip-compressed SSE chunks. When `Content-Encoding: gzip`
+    /// and the mode is `Sse`, compressed chunks cannot be decoded incrementally
+    /// — they are buffered here instead. At `end_of_stream` the buffer is
+    /// decompressed and fed through the SSE holdback for scanning.
+    gzip_buf: Option<Vec<u8>>,
 }
 
 impl ResponseState {
@@ -156,6 +161,7 @@ impl ResponseState {
             mode: ResponseBodyMode::Buffered(Vec::new()),
             content_type: None,
             content_encoding: None,
+            gzip_buf: None,
         }
     }
 
@@ -193,11 +199,20 @@ impl ResponseState {
             }
         }
 
+        let is_gzip = content_encoding
+            .as_deref()
+            .is_some_and(|ce| ce.eq_ignore_ascii_case("gzip"));
         let is_sse = content_type
             .as_deref()
             .is_some_and(|ct| ct.to_ascii_lowercase().starts_with("text/event-stream"));
         if is_sse {
             self.mode = ResponseBodyMode::Sse;
+        }
+        // For gzip-compressed SSE, chunks arrive as binary ciphertext and
+        // cannot be decoded as UTF-8 incrementally. We buffer them here and
+        // decompress+scan at end_of_stream.
+        if is_sse && is_gzip {
+            self.gzip_buf = Some(Vec::new());
         }
 
         self.content_type = content_type;
@@ -501,23 +516,85 @@ fn handle_response_chunk(
         hold,
         last_redactions,
         utf8_carry,
+        gzip_buf,
         ..
     } = state;
 
-    // When the upstream compresses the body (Content-Encoding: gzip), SSE
-    // chunks arrive as binary ciphertext that cannot be decoded as UTF-8 or
-    // scanned incrementally. Pass through without redaction — the client
-    // handles gzip decompression transparently over a Content-Encoding-aware
-    // connection, so PII that was already exposed upstream is visible to the
-    // client regardless. This is the same trade the raw-Envoy path makes:
-    // gzip responses are opaque to the ext_proc.
-    if state
-        .content_encoding
-        .as_deref()
-        .is_some_and(|ce| ce.eq_ignore_ascii_case("gzip"))
-    {
-        // Return the chunk as-is, no scanning or redaction.
-        return body_response(Direction::Response, chunk.to_vec());
+    // For gzip-compressed SSE, chunks arrive as binary ciphertext that cannot
+    // be decoded as UTF-8 or scanned incrementally. Buffer them, decompress
+    // at end_of_stream, then feed through the SSE holdback.
+    if let Some(buf) = gzip_buf {
+        buf.extend_from_slice(chunk);
+        if !end_of_stream {
+            return body_response(Direction::Response, Vec::new());
+        }
+        // End of stream: decompress the accumulated gzip buffer.
+        if let Err(e) = decompress_gzip(buf) {
+            tracing::error!(error = %e, "SSE gzip decompression failed");
+            return refuse_or_block(
+                Direction::Response,
+                engine,
+                metrics,
+                &format!("SSE gzip decompression failed: {e}"),
+            );
+        }
+        // Now buf holds the decompressed SSE text. Feed it through the
+        // holdback for scanning, the same as normal SSE processing.
+        let Ok(text) = std::str::from_utf8(buf) else {
+            return refuse_or_block(
+                Direction::Response,
+                engine,
+                metrics,
+                "decompressed SSE bytes are not valid UTF-8",
+            );
+        };
+        let emit = hold.push(engine, text).and_then(|first| {
+            let first = match first {
+                SseEmit::Blocked(entities) => return Ok(SseEmit::Blocked(entities)),
+                other => other,
+            };
+            let last = hold.flush(engine)?;
+            Ok(match (first, last) {
+                (SseEmit::Release(mut a), SseEmit::Release(b)) => {
+                    a.push_str(&b);
+                    SseEmit::Release(a)
+                }
+                (SseEmit::Release(a), SseEmit::Nothing) => SseEmit::Release(a),
+                (SseEmit::Nothing, other) => other,
+                (SseEmit::Blocked(_), _) => unreachable!("Blocked already returned"),
+                (SseEmit::Release(_), SseEmit::Blocked(_)) => {
+                    unreachable!("flush cannot find a block")
+                }
+            })
+        });
+        let delta = hold.redactions().saturating_sub(*last_redactions);
+        if delta > 0 {
+            metrics.redactions_total.inc_by(delta as u64);
+            *last_redactions = hold.redactions();
+        }
+        return match emit {
+            Ok(SseEmit::Nothing) => body_response(Direction::Response, Vec::new()),
+            Ok(SseEmit::Release(out)) => body_response(Direction::Response, out.into_bytes()),
+            Ok(SseEmit::Blocked(entities)) => {
+                metrics.blocked_total.inc();
+                tracing::warn!(?entities, "blocked response: prohibited content");
+                immediate_response(
+                    Direction::Response,
+                    StatusCode::UnprocessableEntity,
+                    "content_blocked",
+                    &format!(
+                        "response blocked: content matched a prohibited category ({})",
+                        entities.join(", ")
+                    ),
+                )
+            }
+            Err(e) => refuse_or_block(
+                Direction::Response,
+                engine,
+                metrics,
+                &format!("response scan failed: {e}"),
+            ),
+        };
     }
 
     let Ok(text) = decode_chunk_with_carry(utf8_carry, chunk) else {

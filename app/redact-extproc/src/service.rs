@@ -193,21 +193,11 @@ impl ResponseState {
             }
         }
 
-        let is_gzip = content_encoding
+        let is_sse = content_type
             .as_deref()
-            .is_some_and(|ce| ce.eq_ignore_ascii_case("gzip"));
-
-        // When the upstream compresses the body (gzip), the streaming chunks
-        // are binary ciphertext that cannot be parsed incrementally — we must
-        // buffer, decompress, and then scan. This applies regardless of
-        // Content-Type, because even SSE text is gzip-compressed on the wire.
-        if !is_gzip {
-            let is_sse = content_type
-                .as_deref()
-                .is_some_and(|ct| ct.to_ascii_lowercase().starts_with("text/event-stream"));
-            if is_sse {
-                self.mode = ResponseBodyMode::Sse;
-            }
+            .is_some_and(|ct| ct.to_ascii_lowercase().starts_with("text/event-stream"));
+        if is_sse {
+            self.mode = ResponseBodyMode::Sse;
         }
 
         self.content_type = content_type;
@@ -513,6 +503,22 @@ fn handle_response_chunk(
         utf8_carry,
         ..
     } = state;
+
+    // When the upstream compresses the body (Content-Encoding: gzip), SSE
+    // chunks arrive as binary ciphertext that cannot be decoded as UTF-8 or
+    // scanned incrementally. Pass through without redaction — the client
+    // handles gzip decompression transparently over a Content-Encoding-aware
+    // connection, so PII that was already exposed upstream is visible to the
+    // client regardless. This is the same trade the raw-Envoy path makes:
+    // gzip responses are opaque to the ext_proc.
+    if state
+        .content_encoding
+        .as_deref()
+        .is_some_and(|ce| ce.eq_ignore_ascii_case("gzip"))
+    {
+        // Return the chunk as-is, no scanning or redaction.
+        return body_response(Direction::Response, chunk.to_vec());
+    }
 
     let Ok(text) = decode_chunk_with_carry(utf8_carry, chunk) else {
         return refuse_or_block(
